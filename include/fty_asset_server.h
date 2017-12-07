@@ -28,6 +28,7 @@ extern "C" {
 
 #define TEST_INAME "DC-1"
 #define TEST_ENAME "MyDC"
+#define TEST_BADNAME "UNKNOWN"
 
 //  @interface
 //  Asset server, that takes care about distribution of

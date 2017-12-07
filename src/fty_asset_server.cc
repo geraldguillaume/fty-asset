@@ -192,6 +192,7 @@
 
 #include "fty_asset_classes.h"
 #include <string>
+#include <map>
 #include <tntdb/connect.h>
 #include <functional>
 // TODO add dependencies tntdb and cxxtools
@@ -206,6 +207,30 @@ struct _fty_asset_server_t {
     bool test;
 };
 
+static std::map<std::string,zmsg_t *> cache_iname_to_ASSET;
+static std::map<std::string,std::string> cache_iname_to_name;
+
+static void 
+s_clean_cache(const std::set<std::string>& inames_list)
+{
+    if(inames_list.size () == 0){
+        for(auto &iname:cache_iname_to_ASSET){
+            zmsg_destroy(&iname.second);
+        }
+        cache_iname_to_ASSET.clear();
+        cache_iname_to_name.clear();
+    }else{
+        for(auto const &iname:inames_list){
+            if(cache_iname_to_ASSET.find(iname)!= cache_iname_to_ASSET.end()){
+                zmsg_destroy(&cache_iname_to_ASSET[iname]);
+                cache_iname_to_ASSET.erase(iname);
+            }
+            if(cache_iname_to_name.find(iname)!= cache_iname_to_name.end()){
+                cache_iname_to_name.erase(iname);
+            }
+        }
+    }
+}
 
 //  --------------------------------------------------------------------------
 //  Destroy the fty_asset_server
@@ -219,6 +244,7 @@ fty_asset_server_destroy (fty_asset_server_t **self_p)
         zstr_free (&self->name);
         mlm_client_destroy (&self->mailbox_client);
         mlm_client_destroy (&self->stream_client);
+        s_clean_cache({});
         free (self);
         *self_p = NULL;
     }
@@ -395,8 +421,13 @@ static void
     char *iname_str = zmsg_popstr (msg);
     std::string iname (iname_str);
     std::string ename;
-
-    select_ename_from_iname (iname, ename, cfg->test);
+    if (cache_iname_to_name.find(iname) != cache_iname_to_name.end()){
+        ename = cache_iname_to_name[iname];
+    }else{
+        select_ename_from_iname (iname, ename, cfg->test);
+        if (!ename.empty())
+            cache_iname_to_name[iname] = ename;
+    }
 
     zstr_free (&iname_str);
     if (ename.empty ())
@@ -499,6 +530,12 @@ static zmsg_t *
         bool read_only)
 {
     assert (cfg);
+    if(cache_iname_to_ASSET.find(asset_name) != cache_iname_to_ASSET.end()){
+        zsys_info("use iname_to_ASSET %s",asset_name.c_str());
+        zmsg_t *msg = cache_iname_to_ASSET[asset_name];
+        //TODO : to check operation before reuse cache
+        return zmsg_dup(msg);
+    }
     zhash_t *aux = zhash_new ();
     zhash_autofree (aux);
     uint32_t asset_id = 0;
@@ -653,7 +690,10 @@ static zmsg_t *
             ext);
     zhash_destroy (&ext);
     zhash_destroy (&aux);
-    return msg;
+    //put in cache
+    cache_iname_to_ASSET[asset_name]=msg;
+    return zmsg_dup(msg);
+    
 }
 
 static void
@@ -683,13 +723,68 @@ static void
     auto msg = s_publish_create_or_update_asset_msg(cfg, asset_name, operation, subject, false);
     if (NULL == msg) {
         msg = zmsg_new ();
-        zsys_error ("%s:\tASSET_DETAIL: asset not found", cfg->name);
+        zsys_error ("%s:\tASSET_DETAIL: asset %s not found", cfg->name,asset_name.c_str());
         zmsg_addstr (msg, "ERROR");
         zmsg_addstr (msg, "ASSET_NOT_FOUND");
     }
     zmsg_pushstr(msg, uuid);
     if (0 != mlm_client_sendto (cfg->mailbox_client, address, subject.c_str(), NULL, 5000, &msg)) {
         zsys_error ("%s:\tmlm_client_send failed for asset '%s'", cfg->name, asset_name.c_str());
+        return;
+    }
+}
+
+static void
+    s_sendto_create_or_update_assets (
+        fty_asset_server_t *cfg,
+        const std::set<std::string> &assets_name,
+        const char* operation,
+        const char *address,
+        const char *uuid)
+{
+    zmsg_t *reply = zmsg_new ();
+    zmsg_addstr (reply, uuid);
+    zmsg_addstr (reply, "OK");
+    
+    std::string subject;
+    for(auto const &asset_name:assets_name){
+        zmsg_t *result;
+        auto msg = s_publish_create_or_update_asset_msg(cfg, asset_name, operation, subject, false);
+        if (NULL == msg) {
+            msg = zmsg_new ();
+            zsys_error ("%s:\tASSETS_DETAIL: asset not found", cfg->name);
+            zmsg_addstr (msg, "ERROR");
+            zmsg_addstr (msg, "ASSET_NOT_FOUND");
+            zmsg_addstr (msg, asset_name.c_str());
+            result = msg;
+        }else{
+            result = msg;
+        }
+/* Note: the CZMQ_VERSION_MAJOR comparison below actually assumes versions
+ * we know and care about - v3.0.2 (our legacy default, already obsoleted
+ * by upstream), and v4.x that is in current upstream master. If the API
+ * evolves later (incompatibly), these macros will need to be amended.
+ */
+            zframe_t *frame = NULL;
+// FIXME: should we check and assert(nbytes>0) here, for both API versions,
+// as we do in other similar cases?
+#if CZMQ_VERSION_MAJOR == 3
+            {
+                byte *buffer = NULL;
+                size_t nbytes = zmsg_encode (result, &buffer);
+                frame = zframe_new ((void *) buffer, nbytes);
+                free (buffer);
+                buffer = NULL;
+            }
+#else
+            frame = zmsg_encode (result);
+#endif
+            assert (frame);
+            zmsg_destroy (&result);
+            zmsg_append (reply, &frame);
+    }
+    if (0 != mlm_client_sendto (cfg->mailbox_client, address, subject.c_str(), NULL, 5000, &reply)) {
+        zsys_error ("%s:\tmlm_client_send failed to %s", cfg->name,address);
         return;
     }
 }
@@ -720,6 +815,42 @@ static void
     char *asset_name = zmsg_popstr (zmessage);
     s_sendto_create_or_update_asset (cfg, asset_name, FTY_PROTO_ASSET_OP_UPDATE, mlm_client_sender (cfg->mailbox_client), uuid);
     zstr_free (&asset_name);
+    zstr_free (&uuid);
+}
+
+static void
+    s_handle_subject_assets_detail (fty_asset_server_t *cfg, zmsg_t **zmessage_p)
+{
+    if (!cfg || !zmessage_p || !*zmessage_p) return;
+    zmsg_t *zmessage = *zmessage_p;
+    char* c_command = zmsg_popstr (zmessage);
+    if (! streq (c_command, "GET")) {
+        char* uuid = zmsg_popstr (zmessage);
+        zmsg_t *reply = zmsg_new ();
+        zsys_error ("%s:\tASSETS_DETAIL: bad command '%s', expected GET", cfg->name, c_command);
+        if (uuid)
+            zmsg_addstr (reply, uuid);
+        zmsg_addstr (reply, "ERROR");
+        zmsg_addstr (reply, "BAD_COMMAND");
+        mlm_client_sendto (cfg->mailbox_client, mlm_client_sender (cfg->mailbox_client), "ASSETS_DETAIL", NULL, 5000, &reply);
+        zstr_free (&c_command);
+        zmsg_destroy (&reply);
+        return;
+    }
+    zstr_free (&c_command);
+
+    // select a set of unique asset and reply it through mailbox
+    char* uuid = zmsg_popstr (zmessage);
+    std::set<std::string> assets_list;
+    char *asset_name = zmsg_popstr (zmessage);
+    while(asset_name!=NULL){
+        assets_list.insert(asset_name);
+        zstr_free (&asset_name);
+        asset_name = zmsg_popstr (zmessage);
+    }
+    
+    s_sendto_create_or_update_assets (cfg, assets_list, FTY_PROTO_ASSET_OP_UPDATE, mlm_client_sender (cfg->mailbox_client), uuid);
+    
     zstr_free (&uuid);
 }
 
@@ -832,7 +963,9 @@ static void
 s_repeat_all (fty_asset_server_t *cfg, const std::set<std::string>& assets_to_publish)
 {
     assert (cfg);
-
+    //clear cache
+    s_clean_cache(assets_to_publish);
+    
     std::vector <std::string> asset_names;
     std::function<void(const tntdb::Row&)> cb = \
         [&asset_names, &assets_to_publish](const tntdb::Row &row)
@@ -1020,6 +1153,10 @@ fty_asset_server (zsock_t *pipe, void *args)
             else
             if (subject == "ASSET_DETAIL") {
                 s_handle_subject_asset_detail (cfg, &zmessage);
+            }
+            else
+            if (subject == "ASSETS_DETAIL") {
+                s_handle_subject_assets_detail (cfg, &zmessage);
             }
             else
                 zsys_info ("%s:\tUnexpected subject '%s'", cfg->name, subject.c_str ());
@@ -1297,11 +1434,77 @@ fty_asset_server_test (bool verbose)
         zclock_sleep (200);
         zsys_info ("fty-asset-server-test:Test #11: OK");
     }
+    
+    // Test #11: subject ASSETS_DETAIL, message GET/<iname1>/../<inameX>
+    {
+        zsys_debug ("fty-asset-server-test:Test #11");
+        const char* subject = "ASSETS_DETAIL";
+        const char *command = "GET";
+        const char *uuid = "UUID-0000-TEST";
+        zmsg_t *msg = zmsg_new();
+        zmsg_addstr (msg, command);
+        zmsg_addstr (msg, uuid);
+        zmsg_addstr (msg, asset_name);    //iname1
+        zmsg_addstr (msg, TEST_BADNAME);  //iname2
+        int rv = mlm_client_sendto (ui, asset_server_test_name, subject, NULL, 5000, &msg);
+        assert (rv == 0);
+        zmsg_t *reply = mlm_client_recv (ui);
+        assert (zmsg_size (reply) == 4);
+        char *rcv_uuid = zmsg_popstr (reply);
+        assert (0 == strcmp (rcv_uuid, uuid));
+        zstr_free (&rcv_uuid);
+        //OK or ERROR
+        char *rcv_rv = zmsg_popstr (reply);
+        assert (0 == strcmp (rcv_rv, "OK"));
+        zstr_free (&rcv_rv);
+        //first frame => expect TEST_INAME details
+        zframe_t *frame = zmsg_pop (reply);
+        zmsg_t *decoded_zmsg;
+#if CZMQ_VERSION_MAJOR == 3
+        decoded_zmsg = zmsg_decode (zframe_data (frame), zframe_size (frame));
+#else
+        decoded_zmsg = zmsg_decode (frame);
+#endif
+        assert(decoded_zmsg);
+        zframe_destroy (&frame);
+        assert (fty_proto_is (decoded_zmsg));
+        fty_proto_t *freply = fty_proto_decode (&decoded_zmsg);
+        const char *str = fty_proto_name (freply);
+        assert (streq (str, asset_name));
+        str = fty_proto_operation (freply);
+        assert (streq (str, FTY_PROTO_ASSET_OP_UPDATE));
+        fty_proto_destroy (&freply);
+        
+        //second frame => expect ERROR
+        frame = zmsg_pop (reply);
+#if CZMQ_VERSION_MAJOR == 3
+        decoded_zmsg = zmsg_decode (zframe_data (frame), zframe_size (frame));
+#else
+        decoded_zmsg = zmsg_decode (frame);
+#endif
+        assert(decoded_zmsg);
+        zframe_destroy (&frame);
+        assert (!fty_proto_is (decoded_zmsg));
+        assert (zmsg_size (decoded_zmsg) == 3);
+        char *error_expected = zmsg_popstr (decoded_zmsg);
+        assert (streq (error_expected, "ERROR"));
+        zstr_free(&error_expected);
+        char *detail_expected = zmsg_popstr (decoded_zmsg);
+        assert (streq (detail_expected, "ASSET_NOT_FOUND"));
+        zstr_free(&detail_expected);
+        char *unknown_expected = zmsg_popstr (decoded_zmsg);
+        assert (streq (unknown_expected, "UNKNOWN"));
+        zstr_free(&unknown_expected);
+        zmsg_destroy (&decoded_zmsg);
+        zsys_info ("fty-asset-server-test:Test #11: OK");
+    }
 
     zactor_destroy (&autoupdate_server);
     zactor_destroy (&asset_server);
     mlm_client_destroy (&ui);
     zactor_destroy (&server);
+    
+    
 
     //  @end
     printf ("OK\n");
